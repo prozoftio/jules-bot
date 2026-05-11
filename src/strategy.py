@@ -78,11 +78,11 @@ class MarketRegimeHMM:
         sorted_indices = np.argsort(variances)
 
         # State with lowest variance
-        lowest_var_state = int(sorted_indices[0])
+        lowest_var_state = int(sorted_indices[0].item() if isinstance(sorted_indices[0], np.ndarray) else sorted_indices[0])
         # State with middle variance
-        middle_var_state = int(sorted_indices[1])
+        middle_var_state = int(sorted_indices[1].item() if isinstance(sorted_indices[1], np.ndarray) else sorted_indices[1])
         # State with highest variance
-        highest_var_state = int(sorted_indices[2])
+        highest_var_state = int(sorted_indices[2].item() if isinstance(sorted_indices[2], np.ndarray) else sorted_indices[2])
 
         self.state_map[lowest_var_state] = 'Mean Reverting'
         self.state_map[middle_var_state] = 'Trending'
