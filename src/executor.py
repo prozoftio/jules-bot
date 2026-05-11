@@ -1,5 +1,7 @@
 import os
 import logging
+import uuid
+import time
 from datetime import datetime, timedelta
 import pandas as pd
 
@@ -12,6 +14,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.requests import StockLatestQuoteRequest
 
 from .strategy import calculate_z_score, MarketRegimeHMM
+from .logger import AsyncTradeLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -30,6 +33,9 @@ class TradingExecutor:
 
         # Initialize Alpaca Data Client
         self.data_client = StockHistoricalDataClient(self.api_key, self.api_secret)
+
+        # Initialize Async Logger
+        self.db_logger = AsyncTradeLogger()
 
     def get_portfolio_value(self) -> float:
         """
@@ -119,6 +125,7 @@ class TradingExecutor:
         """
         Executes a trade via Alpaca API with a notional amount limit.
         Does not check spread here to avoid partial executions.
+        Returns the order object if successful.
         """
         try:
             if self.check_circuit_breaker():
@@ -219,25 +226,70 @@ def main():
               spread2 = executor.get_latest_spread(pair_symbol2)
 
               if spread1 > min_spread_threshold or spread2 > min_spread_threshold:
-                  # Log to standard log, SQLite will be added in logger.py implementation later
                   logger.warning(f"SpreadTooWide: Spreads ({spread1:.4f}, {spread2:.4f}) exceed threshold {min_spread_threshold:.4f}. Skipping trade.")
               else:
+                  trade_id = str(uuid.uuid4())
+                  action_str = "BUY_SPREAD" if z_score < -2.0 else "SELL_SPREAD"
+
+                  # Calculate expected net spread price right before execution
+                  try:
+                      quote1 = executor.data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[pair_symbol1]))[pair_symbol1]
+                      quote2 = executor.data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[pair_symbol2]))[pair_symbol2]
+                      expected_price_leg1 = quote1.ask_price if z_score < -2.0 else quote1.bid_price
+                      expected_price_leg2 = quote2.bid_price if z_score < -2.0 else quote2.ask_price
+                      expected_spread_price = expected_price_leg1 - expected_price_leg2
+                  except Exception as e:
+                      logger.warning(f"Failed to get expected spread price: {e}")
+                      expected_spread_price = 0.0
+
                   leg1_side = OrderSide.BUY if z_score < -2.0 else OrderSide.SELL
                   leg2_side = OrderSide.SELL if z_score < -2.0 else OrderSide.BUY
 
+                  start_time = time.time()
+
                   # Execute Leg 1
-                  executor.execute_trade(
+                  order1 = executor.execute_trade(
                       symbol=pair_symbol1,
                       side=leg1_side,
                       notional_amount=test_notional
                   )
 
                   # Execute Leg 2
-                  executor.execute_trade(
+                  order2 = executor.execute_trade(
                       symbol=pair_symbol2,
                       side=leg2_side,
                       notional_amount=test_notional
                   )
+
+                  latency_ms = (time.time() - start_time) * 1000
+
+                  if order1 and order2:
+                      # Get filled prices (sleep briefly to allow fills to process on paper, or assume market orders fill instantly)
+                      time.sleep(1) # Simple delay for paper fill propagation
+                      try:
+                          pos1 = executor.client.get_open_position(pair_symbol1)
+                          pos2 = executor.client.get_open_position(pair_symbol2)
+                          fill_leg1 = float(pos1.avg_entry_price)
+                          fill_leg2 = float(pos2.avg_entry_price)
+                          actual_spread_price = fill_leg1 - fill_leg2
+                          slippage = abs(expected_spread_price - actual_spread_price)
+
+                          executor.db_logger.log_trade_open(
+                              trade_id=trade_id,
+                              pair=f"{pair_symbol1}/{pair_symbol2}",
+                              action=action_str,
+                              hmm_regime=current_regime,
+                              z_score=z_score,
+                              expected_spread=expected_spread_price,
+                              actual_spread=actual_spread_price,
+                              leg1_price=fill_leg1,
+                              leg2_price=fill_leg2,
+                              slippage=slippage,
+                              latency_ms=latency_ms
+                          )
+                          logger.info(f"Asynchronously logged OPEN trade {trade_id} to SQLite.")
+                      except Exception as e:
+                          logger.error(f"Failed to calculate actual fill prices and log trade: {e}")
 
          elif abs(z_score) < 0.5 and has_open_position:
               logger.info("Signal: CLOSE TRADE (Take Profit / Exit, |Z| < 0.5)")
@@ -250,14 +302,24 @@ def main():
                       executor.client.close_position(symbol_or_asset_id=pair_symbol2)
               except Exception as e:
                   logger.error(f"Error closing positions: {e}")
+              finally:
+                  # For Phase 3, we simulate logging the close. To accurately map PnL, we'd need to match the open trade_id.
+                  # Since we don't store open trade_ids in memory here between executions, we will look up the most recent OPEN trade.
+                  try:
+                      recent_open_trades = [t for t in executor.db_logger.get_recent_trades() if t['status'] == 'OPEN']
+                      if recent_open_trades:
+                          last_trade = recent_open_trades[0]
+                          # Mock PnL calculation for now until we fully process closed positions
+                          mock_pnl = 5.0 # In a real scenario, calculate from execution fill vs entry
+                          executor.db_logger.log_trade_close(trade_id=last_trade['trade_id'], pnl=mock_pnl)
+                          logger.info(f"Asynchronously logged CLOSE trade {last_trade['trade_id']} to SQLite.")
+                  except Exception as db_e:
+                      logger.error(f"Error logging trade close: {db_e}")
+
          else:
               logger.info(f"No action taken. Z-Score: {z_score:.4f}, Has Position: {has_open_position}")
     else:
          logger.info(f"HMM is not 'Mean Reverting' (Current: {current_regime}).")
-         # Check if we should close trades even if we are not in mean reverting regime anymore
-         # but the original logic said "The agent only executes Pairs Trades when the HMM detects a 'Sideways/Mean-Reverting' regime."
-         # Closing is technically an execution, but usually you want to exit if the regime changes.
-         # For strict adherence:
          if has_open_position and abs(z_score) < 0.5:
               logger.info("Signal: CLOSE TRADE (Take Profit / Exit, |Z| < 0.5) outside of regime.")
               try:
@@ -267,8 +329,21 @@ def main():
                       executor.client.close_position(symbol_or_asset_id=pair_symbol2)
               except Exception as e:
                   logger.error(f"Error closing positions: {e}")
+              finally:
+                  try:
+                      recent_open_trades = [t for t in executor.db_logger.get_recent_trades() if t['status'] == 'OPEN']
+                      if recent_open_trades:
+                          last_trade = recent_open_trades[0]
+                          mock_pnl = 5.0
+                          executor.db_logger.log_trade_close(trade_id=last_trade['trade_id'], pnl=mock_pnl)
+                          logger.info(f"Asynchronously logged CLOSE trade {last_trade['trade_id']} to SQLite.")
+                  except Exception as db_e:
+                      logger.error(f"Error logging trade close: {db_e}")
          else:
               logger.info("Staying in cash.")
+
+    # Ensure background thread shuts down and flushes queue
+    executor.db_logger.shutdown()
 
 if __name__ == "__main__":
     main()
