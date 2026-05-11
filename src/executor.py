@@ -1,11 +1,17 @@
 import os
 import logging
+from datetime import datetime, timedelta
+import pandas as pd
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.requests import StockLatestQuoteRequest
 
-# Hardcoded strictly to Paper Trading
-PAPER_URL = "https://paper-api.alpaca.markets"
+from .strategy import calculate_z_score, MarketRegimeHMM
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -13,18 +19,17 @@ logger = logging.getLogger(__name__)
 class TradingExecutor:
     def __init__(self):
         # Always use paper trading URL
-        api_key = os.environ.get("APCA_API_KEY_ID")
-        api_secret = os.environ.get("APCA_API_SECRET_KEY")
+        self.api_key = os.environ.get("APCA_API_KEY_ID")
+        self.api_secret = os.environ.get("APCA_API_SECRET_KEY")
 
-        if not api_key or not api_secret:
+        if not self.api_key or not self.api_secret:
             logger.warning("Alpaca API credentials not found in environment variables.")
 
-        # We ensure paper=True for safety as well.
-        self.client = TradingClient(api_key, api_secret, paper=True)
+        # Initialize Alpaca Trading Client (Paper=True strictly enforced)
+        self.client = TradingClient(self.api_key, self.api_secret, paper=True)
 
-        # We can also override the URL just to be absolutely certain we're on paper
-        # Though alpaca-py uses paper=True to route to paper-api.alpaca.markets
-        # we will ensure it doesn't accidentally hit production.
+        # Initialize Alpaca Data Client
+        self.data_client = StockHistoricalDataClient(self.api_key, self.api_secret)
 
     def get_portfolio_value(self) -> float:
         """
@@ -37,6 +42,30 @@ class TradingExecutor:
             logger.error(f"Error fetching portfolio value: {e}")
             return 0.0
 
+    def check_circuit_breaker(self) -> bool:
+        """
+        Checks if the daily PnL has dropped below -2%.
+        If so, halts trading.
+        """
+        try:
+            account = self.client.get_account()
+            equity = float(account.equity)
+            last_equity = float(account.last_equity)
+
+            if last_equity == 0:
+                 return False
+
+            pnl_pct = (equity - last_equity) / last_equity
+
+            if pnl_pct < -0.02:
+                logger.critical(f"CIRCUIT BREAKER TRIGGERED: Daily PnL is {pnl_pct*100:.2f}%. Trading Halted.")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking circuit breaker: {e}")
+            # If we can't verify safety, default to unsafe
+            return True
+
     def calculate_position_size(self, portfolio_value: float, risk_limit_pct: float = 0.05) -> float:
         """
         Calculates the maximum dollar amount to risk for a single trade.
@@ -46,11 +75,55 @@ class TradingExecutor:
         actual_risk_limit = min(risk_limit_pct, 0.05)
         return portfolio_value * actual_risk_limit
 
+    def fetch_historical_data(self, symbol: str, days: int = 60) -> pd.DataFrame:
+        """
+        Fetches historical hourly data for a given symbol.
+        """
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        request_params = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame.Hour,
+            start=start_date,
+            end=end_date
+        )
+
+        try:
+            bars = self.data_client.get_stock_bars(request_params)
+            df = bars.df
+            # Dataframes from alpaca have multi-index (symbol, timestamp)
+            if not df.empty:
+               # Get just the single symbol data
+               df = df.xs(symbol, level='symbol')
+            return df
+        except Exception as e:
+            logger.error(f"Error fetching historical data for {symbol}: {e}")
+            return pd.DataFrame()
+
+    def get_latest_spread(self, symbol: str) -> float:
+        """
+        Fetches the latest quote and calculates the bid-ask spread.
+        """
+        request_params = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+        try:
+            quotes = self.data_client.get_stock_latest_quote(request_params)
+            quote = quotes[symbol]
+            spread = quote.ask_price - quote.bid_price
+            return spread
+        except Exception as e:
+            logger.error(f"Error fetching quote for {symbol}: {e}")
+            return float('inf')
+
     def execute_trade(self, symbol: str, side: OrderSide, notional_amount: float):
         """
         Executes a trade via Alpaca API with a notional amount limit.
+        Does not check spread here to avoid partial executions.
         """
         try:
+            if self.check_circuit_breaker():
+                 return None
+
             portfolio_value = self.get_portfolio_value()
             max_allowed_risk = self.calculate_position_size(portfolio_value)
 
@@ -73,52 +146,129 @@ class TradingExecutor:
             logger.error(f"Error executing trade: {e}")
             return None
 
-def stub_hmm_regime_detection():
-    """
-    Stub for HMM regime detection.
-    Will eventually return the current market regime (e.g., 'trending', 'mean_reverting', 'volatile').
-    """
-    # Hardcoded for Phase 1 testing
-    return 'mean_reverting'
-
-def stub_pairs_trading_signal():
-    """
-    Stub for Statistical Arbitrage (Pairs Trading) signal.
-    Will eventually return the Z-score and trading signal.
-    """
-    # Hardcoded for Phase 1 testing
-    return {
-        'signal': 'buy',
-        'symbol1': 'AAPL',
-        'symbol2': 'MSFT',
-        'z_score': -2.5
-    }
-
 def main():
     logger.info("Initializing Trading Executor...")
     executor = TradingExecutor()
 
-    # 1. HMM Regime Detection
-    regime = stub_hmm_regime_detection()
-    logger.info(f"Current Market Regime: {regime}")
+    if executor.check_circuit_breaker():
+         return
 
-    # 2. If in a favorable regime, check pairs trading signal
-    if regime == 'mean_reverting':
-        signal_data = stub_pairs_trading_signal()
-        logger.info(f"Generated Trade Signal: {signal_data}")
+    # Configuration
+    spy_symbol = "SPY"
+    pair_symbol1 = "KO"
+    pair_symbol2 = "PEP"
+    days_history = 60
+    min_spread_threshold = 0.05
 
-        if signal_data['signal'] == 'buy':
-            # Example execution: Buying the spread
-            # In a real pairs trade, we would buy one and short the other.
-            # For this stub, we'll just demonstrate the execution plumbing with one leg.
+    logger.info("Starting Warm-up Phase: Fetching 60 days of historical data...")
+    spy_data = executor.fetch_historical_data(spy_symbol, days=days_history)
+    s1_data = executor.fetch_historical_data(pair_symbol1, days=days_history)
+    s2_data = executor.fetch_historical_data(pair_symbol2, days=days_history)
 
-            # Use a safe notional amount for testing (e.g., $10)
-            test_notional = 10.0
-            executor.execute_trade(
-                symbol=signal_data['symbol1'],
-                side=OrderSide.BUY,
-                notional_amount=test_notional
-            )
+    if spy_data.empty or s1_data.empty or s2_data.empty:
+         logger.error("Failed to fetch historical data for warm-up. Exiting.")
+         return
+
+    # Calculate returns for SPY for HMM
+    spy_returns = spy_data['close'].pct_change().dropna()
+
+    # Train HMM
+    logger.info("Training HMM on SPY returns...")
+    hmm = MarketRegimeHMM(n_components=3)
+
+    # Fix Look-ahead bias: Fit HMM on historical data up to previous timestamp
+    # Predict the state for the current timestamp
+    hmm.fit(spy_returns.iloc[:-1])
+
+    current_regime = hmm.predict(spy_returns)
+    logger.info(f"Current Market Regime: {current_regime}")
+
+    # Calculate Z-Score for pair
+    # Assuming spread is log(price1) - log(price2) or just price1 - price2 for simplicity
+    # Align dataframes
+    s1_close, s2_close = s1_data['close'].align(s2_data['close'], join='inner')
+    spread = s1_close - s2_close
+
+    z_score = calculate_z_score(spread, window=60)
+    logger.info(f"Current Z-Score for {pair_symbol1}-{pair_symbol2}: {z_score:.4f}")
+
+    # Logic Gate
+    # To manage state, we would typically check our current positions.
+    # For now, we will query Alpaca to see if we have open positions for these symbols.
+    try:
+        open_positions = executor.client.get_all_positions()
+        open_symbols = [p.symbol for p in open_positions]
+        has_open_position = pair_symbol1 in open_symbols or pair_symbol2 in open_symbols
+    except Exception as e:
+        logger.error(f"Failed to fetch open positions: {e}")
+        has_open_position = False
+
+    if current_regime == 'Mean Reverting':
+         if abs(z_score) > 2.0 and not has_open_position:
+              logger.info("Signal: OPEN TRADE (HMM=Mean Reverting, |Z| > 2.0)")
+
+              # Execute trade logic (Multi-leg pairs execution)
+              # If Z-score is negative (spread < mean): buy leg 1, short leg 2
+              # If Z-score is positive (spread > mean): short leg 1, buy leg 2
+              # For paper trading purposes with notional, shorting might have constraints.
+              # Assuming standard long/short execution.
+              test_notional = 10.0
+
+              # Validate spreads for BOTH legs before execution to prevent unhedged positions
+              spread1 = executor.get_latest_spread(pair_symbol1)
+              spread2 = executor.get_latest_spread(pair_symbol2)
+
+              if spread1 > min_spread_threshold or spread2 > min_spread_threshold:
+                  # Log to standard log, SQLite will be added in logger.py implementation later
+                  logger.warning(f"SpreadTooWide: Spreads ({spread1:.4f}, {spread2:.4f}) exceed threshold {min_spread_threshold:.4f}. Skipping trade.")
+              else:
+                  leg1_side = OrderSide.BUY if z_score < -2.0 else OrderSide.SELL
+                  leg2_side = OrderSide.SELL if z_score < -2.0 else OrderSide.BUY
+
+                  # Execute Leg 1
+                  executor.execute_trade(
+                      symbol=pair_symbol1,
+                      side=leg1_side,
+                      notional_amount=test_notional
+                  )
+
+                  # Execute Leg 2
+                  executor.execute_trade(
+                      symbol=pair_symbol2,
+                      side=leg2_side,
+                      notional_amount=test_notional
+                  )
+
+         elif abs(z_score) < 0.5 and has_open_position:
+              logger.info("Signal: CLOSE TRADE (Take Profit / Exit, |Z| < 0.5)")
+              try:
+                  if pair_symbol1 in open_symbols:
+                      logger.info(f"Closing position for {pair_symbol1}...")
+                      executor.client.close_position(symbol_or_asset_id=pair_symbol1)
+                  if pair_symbol2 in open_symbols:
+                      logger.info(f"Closing position for {pair_symbol2}...")
+                      executor.client.close_position(symbol_or_asset_id=pair_symbol2)
+              except Exception as e:
+                  logger.error(f"Error closing positions: {e}")
+         else:
+              logger.info(f"No action taken. Z-Score: {z_score:.4f}, Has Position: {has_open_position}")
+    else:
+         logger.info(f"HMM is not 'Mean Reverting' (Current: {current_regime}).")
+         # Check if we should close trades even if we are not in mean reverting regime anymore
+         # but the original logic said "The agent only executes Pairs Trades when the HMM detects a 'Sideways/Mean-Reverting' regime."
+         # Closing is technically an execution, but usually you want to exit if the regime changes.
+         # For strict adherence:
+         if has_open_position and abs(z_score) < 0.5:
+              logger.info("Signal: CLOSE TRADE (Take Profit / Exit, |Z| < 0.5) outside of regime.")
+              try:
+                  if pair_symbol1 in open_symbols:
+                      executor.client.close_position(symbol_or_asset_id=pair_symbol1)
+                  if pair_symbol2 in open_symbols:
+                      executor.client.close_position(symbol_or_asset_id=pair_symbol2)
+              except Exception as e:
+                  logger.error(f"Error closing positions: {e}")
+         else:
+              logger.info("Staying in cash.")
 
 if __name__ == "__main__":
     main()
